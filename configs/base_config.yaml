@@ -1,0 +1,19 @@
+# For system configuration, num clients, num rounds, epochs, learning rate, model, non-iid params, 
+
+# ex.
+
+dataset: "mnist"
+model: "cnn"
+non_iid_alpha: 0.5
+
+# Federated Learning
+num_clients: 50
+num_rounds: 100
+local_epochs: 5
+learning_rate: 0.01
+
+# FedAsynCS Specific
+server_buffer_size: 10
+compression_ratio: 0.1
+
+# (may need to add stuff based on changing requirements)
