@@ -1,0 +1,98 @@
+syntax = "proto3";
+
+package fedac_cs;
+
+// The Federated Learning Service definition.
+service FederatedLearning {
+  // Client calls this to download the latest global model and correction term.
+  rpc GetGlobalModel (Empty) returns (ModelResponse) {}
+
+  // Client calls this to upload their compressed, corrected update.
+  // Returns a status acknowledgment.
+  rpc SubmitUpdate (ClientUpdate) returns (Ack) {}
+}
+
+// Empty message for requests that require no parameters.
+message Empty {}
+
+// Simple acknowledgment.
+message Ack {
+  bool success = 1;
+  string message = 2;
+}
+
+// ---------------------------------------------------------
+// Server -> Client Messages
+// ---------------------------------------------------------
+
+message ModelResponse {
+  // The current global round index 't'.
+  // Used by client to track staleness (tau).
+  int32 round_id = 1;
+
+  // The Global Model parameters (x^t).
+  // Flattened 1D array of floats.
+  repeated float weights = 2;
+
+  // The Global Correction Term (c^t).
+  // Required for the FedAC client-side correction: g_i + c^t - c_i
+  // Reference: FedAC Eq. (12)
+  repeated float global_control_variate = 3;
+}
+
+// ---------------------------------------------------------
+// Client -> Server Messages
+// ---------------------------------------------------------
+
+message ClientUpdate {
+  // Unique ID of the client.
+  string client_id = 1;
+
+  // The round index of the global model this update was based on (tau).
+  // Server uses this to calculate staleness: s(t - tau).
+  // Reference: FedAC Eq. (3)
+  int32 base_model_round_id = 2;
+
+  // -------------------------------------------------------
+  // 1-Bit Compressed Sensing Payload
+  // Reference: 1-bit CS-FL Section III
+  // -------------------------------------------------------
+  
+  // The 1-bit quantized compressed gradient (z_t^i).
+  // Since these are bits, we pack them into bytes for efficiency.
+  // 1 byte = 8 gradient signs.
+  // bytes compressed_1bit_gradient = 3;
+
+  // Was: bytes compressed_1bit_gradient = 3;
+  // Change to:
+  bytes compressed_payload = 3;
+
+  // The random seed used to generate the Measurement Matrix (A_t).
+  // The server uses this to regenerate the exact same matrix A 
+  // to run BIHT reconstruction.
+  int32 measurement_seed = 4;
+
+  // The original length of the flattened parameter vector (N).
+  // Required to initialize the reconstruction algorithms.
+  int32 original_vector_len = 5;
+
+  // The length of the compressed vector (M).
+  int32 compressed_vector_len = 6;
+
+  // -------------------------------------------------------
+  // FedAC Specific Payload
+  // -------------------------------------------------------
+
+  // The update to the local control variate (Delta c_i).
+  // Calculated as: c_i_new - c_i_old
+  // Server aggregates this to update global c^t.
+  // Reference: FedAC Eq. (15) and (17)
+  repeated float delta_control_variate = 7;
+
+  // Number of samples used for training (for weighted aggregation if needed).
+  int32 num_samples = 8;
+
+  // Optional: A flag to tell the server how to decode.
+  // Alternatively, this is set in a static config file on both ends.
+  bool is_1bit = 9;
+}

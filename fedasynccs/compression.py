@@ -1,158 +1,147 @@
 import torch
 import math
+import numpy as np
 
-def generate_measurement_matrix(m, n, device='cpu'):
-    """
-    Generates a Gaussian random measurement matrix A of size (m, n).
-    Entries are drawn from N(0, 1/m).
-    """
-    # Using standard normal distribution scaled by 1/sqrt(m)
-    # This ensures the matrix satisfies Restricted Isometry Property (RIP) with high probability
+class CSCompressor:
+    def __init__(self, original_dim: int, compression_ratio: float, device=None):
+        self.N = original_dim
+        self.M = int(original_dim * compression_ratio)
+        # Calculate sparsity k based on CS theory (approximate)
+        if self.M < self.N:
+            self.k = int(self.M / (2 * math.log(self.N / self.M)))
+        else:
+            self.k = self.N 
+        self.device = device if device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+    def generate_measurement_matrix(self, seed: int) -> torch.Tensor:
+        # Use a distinct generator to ensure reproducibility across client/server
+        generator = torch.Generator(device=self.device)
+        generator.manual_seed(int(seed)) # Ensure seed is int
+        
+        # Generate random Gaussian matrix
+        A = torch.randn(self.M, self.N, generator=generator, device=self.device)
+        # Normalize columns for RIP (Restricted Isometry Property) stability
+        # A = A / math.sqrt(self.M) 
+        return A
 
-    # TODO: I feel that the A should be same on client and server side. Passing it alongwith the compressed update would defeat the purpose of the compression.
-    # SOLUTIONS: What if we keep A fixed? What if we generate A from the same random seed on every client and server?
+    def compress(self, update_vector: torch.Tensor, residual_vector: torch.Tensor, seed: int, use_1bit: bool = True):
+        # Ensure inputs are on the correct device
+        update_vector = update_vector.to(self.device)
+        
+        if residual_vector is not None:
+            residual_vector = residual_vector.to(self.device)
+            h = update_vector + residual_vector
+        else:
+            h = update_vector
+        
+        # 1. Sparsify (Top-K Error Feedback)
+        k_val = self.k
+        if k_val > 0 and k_val < self.N:
+            abs_h = torch.abs(h)
+            # kthvalue finds the k-th smallest, so for top-k largest we need (N - k + 1)
+            threshold = torch.kthvalue(abs_h.flatten(), self.N - k_val + 1).values
+            s = torch.where(abs_h >= threshold, h, torch.zeros_like(h))
+        else:
+            s = h # No sparsification if k is invalid or full dimension
+            
+        # 2. Update Residual (e = h - s)
+        new_residual = h - s
+        
+        # 3. Generate Matrix A
+        A = self.generate_measurement_matrix(seed)
+        
+        # 4. Linear Compression: y = As
+        y = torch.matmul(A, s.flatten())
+        
+        if use_1bit:
+            # Component 2: 1-Bit Quantization
+            # z = sign(y). If 0, map to 1 (binary {-1, 1})
+            z = torch.sign(y)
+            z[z == 0] = 1 
+            payload = self._pack_bits(z)
+        else:
+            # Component 1: Analog CS
+            payload = y
+            
+        return payload, new_residual.detach()
 
-    A = torch.randn(m, n, device=device) / math.sqrt(m)
-    return A
+    def reconstruct(self, payload, seed: int, use_1bit: bool = True, iterations: int = 20) -> torch.Tensor:
+        A = self.generate_measurement_matrix(seed)
+        
+        if use_1bit:
+            if isinstance(payload, bytes):
+                z = self._unpack_bits(payload, self.M).to(self.device)
+            else:
+                z = payload.to(self.device)
+            return self._biht(z, A, iterations)
+        else:
+            y = payload.to(self.device)
+            return self._iht(y, A, iterations)
 
-def sparsify_update(update_vector, sparsity_ratio):
-    """
-    Keeps only the top-k elements (largest magnitude) of the update vector.
-    
-    Args:
-        update_vector: The flattened model update (1D tensor).
-        sparsity_ratio: Fraction of elements to keep (e.g., 0.01 for 1%).
-    
-    Returns:
-        sparse_vector: Vector with same shape, but non-top-k elements set to 0.
-    """
-    k = int(update_vector.numel() * sparsity_ratio)
-    if k == 0:
-        k = 1 # Ensure at least one element is kept
+    def _biht(self, z: torch.Tensor, A: torch.Tensor, iterations: int) -> torch.Tensor:
+        """Binary Iterative Hard Thresholding"""
+        x_hat = torch.zeros(self.N, device=self.device)
         
-    # Find the k-th largest value by magnitude
-    # topk returns values and indices, we need the smallest value in the top k
-    threshold = torch.topk(update_vector.abs(), k).values[-1]
-    
-    # Zero out elements with magnitude less than threshold
-    sparse_vector = update_vector.clone()
-    sparse_vector[update_vector.abs() < threshold] = 0
-    
-    return sparse_vector
+        # Compute step size mu once
+        # A is (M, N). 
+        # Spectral norm calculation can be slow for large dims. 
+        # Approximation for random Gaussian: sqrt(N) + sqrt(M) roughly.
+        # For exactness:
+        spectral_norm = torch.linalg.norm(A, ord=2)
+        mu = 1 / (spectral_norm ** 2)
+        
+        for _ in range(iterations):
+            # Ax
+            Ax = torch.matmul(A, x_hat)
+            
+            # Gradient: A.T * (sign(Ax) - z)
+            # We want to minimize consistency loss with observed signs
+            sign_diff = torch.sign(Ax) - z
+            # Handle zeros in Ax if necessary, though float equality is rare
+            
+            gradient = torch.matmul(A.T, sign_diff)
+            x_hat -= mu * gradient
+            
+            # Hard Thresholding
+            x_hat = self._hard_threshold(x_hat)
+            
+        return x_hat
 
-def compress_1bit(sparse_vector, measurement_matrix):
-    """
-    Compresses the sparse vector using the measurement matrix and 1-bit quantization.
-    
-    Formula: z = sign(A @ s)
-    
-    Args:
-        sparse_vector: The N-dimensional sparse update.
-        measurement_matrix: The MxN random matrix.
+    def _iht(self, y: torch.Tensor, A: torch.Tensor, iterations: int) -> torch.Tensor:
+        """Iterative Hard Thresholding"""
+        x_hat = torch.zeros(self.N, device=self.device)
         
-    Returns:
-        compressed_vector: The M-dimensional binary vector (+1 or -1).
-    """
-    # Linear projection
-    y = torch.matmul(measurement_matrix, sparse_vector)
-    
-    # 1-bit Quantization (Sign function)
-    z = torch.sign(y)
-    
-    # Handle zeros: sign(0) = 0, but we need bits (+1/-1). Map 0 to 1 arbitrarily.
-    z[z == 0] = 1 
-    
-    return z
+        spectral_norm = torch.linalg.norm(A, ord=2)
+        mu = 1 / (spectral_norm ** 2)
+        
+        for _ in range(iterations):
+            # Gradient step: x = x + mu * A.T @ (y - A @ x)
+            residual = y - torch.matmul(A, x_hat)
+            grad_step = torch.matmul(A.T, residual)
+            x_hat += mu * grad_step
+            
+            x_hat = self._hard_threshold(x_hat)
+            
+        return x_hat
 
-def biht_reconstruction(z, A, original_size, sparsity_ratio, iterations=20, step_size=1.0):
-    """
-    Binary Iterative Hard Thresholding (BIHT) to reconstruct the sparse vector 
-    from 1-bit measurements.
-    
-    Algorithm:
-        x_{k+1} = HardThreshold(x_k - step * A.T @ (sign(A @ x_k) - z))
-        Note: The gradient of the one-sided L1 loss implies moving towards consistency with z.
-        The standard BIHT step is often: x = x + step * A.T * (z - sign(Ax))
+    def _hard_threshold(self, x: torch.Tensor) -> torch.Tensor:
+        k_val = self.k
+        if k_val <= 0 or k_val >= self.N: return x
         
-    Args:
-        z: Received compressed 1-bit vector (M).
-        A: Measurement matrix (MxN).
-        original_size: N (number of parameters).
-        sparsity_ratio: To determine k for Hard Thresholding.
-        iterations: Number of BIHT steps.
-    
-    Returns:
-        x_hat: Reconstructed sparse vector.
-    """
-    k = int(original_size * sparsity_ratio)
-    if k == 0: k = 1
-    
-    # Initialize estimate x to zero
-    x_hat = torch.zeros(original_size, device=z.device)
-    
-    # Precompute transpose for efficiency if A is large
-    A_T = A.t()
-    
-    for i in range(iterations):
-        # 1. Calculate consistency with measurements
-        Ax = torch.matmul(A, x_hat)
-        z_hat = torch.sign(Ax)
-        z_hat[z_hat == 0] = 1
-        
-        # 2. Compute gradient-like term: A.T * (z - z_hat)
-        # We want x such that sign(Ax) matches z.
-        residual = z - z_hat
-        grad = torch.matmul(A_T, residual)
-        
-        # 3. Gradient Step
-        x_next = x_hat + (step_size / 2) * grad # Dividing by 2 is a common heuristic normalization
-        
-        # 4. Hard Thresholding (Project onto sparsity constraint)
-        # Keep only top-k elements of x_next
-        threshold = torch.topk(x_next.abs(), k).values[-1]
-        x_next[x_next.abs() < threshold] = 0
-        
-        x_hat = x_next
-        
-    return x_hat
+        abs_x = x.abs()
+        threshold = torch.kthvalue(abs_x.flatten(), self.N - k_val + 1).values
+        return torch.where(abs_x >= threshold, x, torch.zeros_like(x))
 
-if __name__ == "__main__":
-    print("=== Running Compression Module Check ===")
-    
-    N = 1000
-    M = 200
-    SPARSITY = 0.01
-    DEVICE = 'cpu'
-    if torch.cuda.is_available(): DEVICE = 'cuda'
-    elif torch.backends.mps.is_available(): DEVICE = 'mps'
-    
-    print(f"Device: {DEVICE}")
-    print(f"Original Dim: {N}, Compressed Dim: {M}, Sparsity: {SPARSITY}")
-    
-    # 1. Create a synthetic sparse update vector
-    original_vector = torch.randn(N, device=DEVICE)
-    original_sparse = sparsify_update(original_vector, SPARSITY)
-    print(f"Original Non-zeros: {torch.count_nonzero(original_sparse).item()}")
-    
-    # 2. Generate Matrix
-    A = generate_measurement_matrix(M, N, device=DEVICE)
-    
-    # 3. Compress
-    z = compress_1bit(original_sparse, A)
-    print(f"Compressed shape: {z.shape}, Values: {torch.unique(z)}")
-    
-    # 4. Reconstruct
-    print("Reconstructing with BIHT...")
-    recovered_vector = biht_reconstruction(z, A, N, SPARSITY, iterations=50)
-    
-    # 5. Evaluate
-    # Cosine similarity is a good metric for update vectors (direction matters more than scale in FL)
-    cos_sim = torch.nn.functional.cosine_similarity(original_sparse.unsqueeze(0), recovered_vector.unsqueeze(0))
-    print(f"Reconstruction Cosine Similarity: {cos_sim.item():.4f}")
-    
-    if cos_sim.item() > 0.6:
-        print("SUCCESS: Reconstruction is highly correlated with original.")
-    else:
-        print("WARNING: Reconstruction correlation is low. Check parameters.")
-        
-    print("=== Check Complete ===")
+    def _pack_bits(self, sign_tensor: torch.Tensor) -> bytes:
+        # Convert {-1, 1} -> {0, 1} for packing
+        # 1 -> 1, -1 -> 0
+        bits = (sign_tensor > 0).cpu().numpy().astype(np.uint8)
+        return np.packbits(bits).tobytes()
+
+    def _unpack_bits(self, byte_data: bytes, length: int) -> torch.Tensor:
+        bits = np.unpackbits(np.frombuffer(byte_data, dtype=np.uint8))
+        bits = bits[:length]
+        # 0 -> -1, 1 -> 1
+        signs = torch.from_numpy(bits.astype(np.float32)).to(self.device)
+        signs = 2 * signs - 1
+        return signs
