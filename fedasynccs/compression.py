@@ -3,15 +3,18 @@ import math
 import numpy as np
 
 class CSCompressor:
-    def __init__(self, original_dim: int, compression_ratio: float, device=None):
+    def __init__(self, original_dim: int, compression_ratio: float, sparsity_ratio: float = None, device=None):
         self.N = original_dim
         self.M = int(original_dim * compression_ratio)
-        # Calculate sparsity k based on CS theory (approximate)
-        if self.M < self.N:
+        self.device = device if device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        if sparsity_ratio is not None:
+            self.k = int(self.N * sparsity_ratio)
+        elif self.M < self.N:
+            # Calculate sparsity k based on CS theory (approximate)
             self.k = int(self.M / (2 * math.log(self.N / self.M)))
         else:
-            self.k = self.N 
-        self.device = device if device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            self.k = self.N
         
     def generate_measurement_matrix(self, seed: int) -> torch.Tensor:
         # Use a distinct generator to ensure reproducibility across client/server
@@ -82,11 +85,7 @@ class CSCompressor:
         """Binary Iterative Hard Thresholding"""
         x_hat = torch.zeros(self.N, device=self.device)
         
-        # Compute step size mu once
-        # A is (M, N). 
-        # Spectral norm calculation can be slow for large dims. 
-        # Approximation for random Gaussian: sqrt(N) + sqrt(M) roughly.
-        # For exactness:
+        # Use calculated mu for stability (matches notebook implementation)
         spectral_norm = torch.linalg.norm(A, ord=2)
         mu = 1 / (spectral_norm ** 2)
         
@@ -95,9 +94,9 @@ class CSCompressor:
             Ax = torch.matmul(A, x_hat)
             
             # Gradient: A.T * (sign(Ax) - z)
-            # We want to minimize consistency loss with observed signs
+            # z is {-1, 1}. 
+            # If sign(Ax) != z, we get error.
             sign_diff = torch.sign(Ax) - z
-            # Handle zeros in Ax if necessary, though float equality is rare
             
             gradient = torch.matmul(A.T, sign_diff)
             x_hat -= mu * gradient
