@@ -1,3 +1,7 @@
 # blah blah stuff
 /fedasynccs/data/
 /fedasynccs/__pycache__
+models/
+logs/
+results/
+data/
