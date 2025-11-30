@@ -1,0 +1,37 @@
+syntax = "proto3";
+
+package fedlearn;
+
+service FederatedLearningServer {
+}
+
+service FederatedLearningClient {
+  rpc SendModel(ModelFile) returns (Status) {}
+  rpc StartTraining(Empty) returns (ModelFile) {}
+  rpc SignSGD(Empty) returns (ModelFlatSign) {}
+  rpc Phase1_CSFL(Empty) returns (ModelFlat) {}
+  rpc Phase1_1B_CSFL(Empty) returns (ModelFlatSign) {}
+  rpc Phase2(Empty) returns (ModelFlatSign) {}
+  rpc UpdateClientWeights(ModelFlat) returns (Status) {}
+  rpc UpdateClientWeightsSign(ModelFlatSign) returns (Status) {}
+  rpc Terminate(Empty) returns (Empty) {}
+}
+
+message ModelFile {
+    bytes content = 1;
+}
+
+message ModelFlat {
+    repeated float content = 1;
+}
+
+message ModelFlatSign {
+    repeated bool content = 1;
+}
+
+message Status {
+    bool ack = 1;
+}
+
+message Empty {
+}

@@ -1,227 +1,243 @@
-import argparse
-import time
-import logging
 import grpc
 import torch
-import numpy as np
+import io
+import etcd3
+import sys
+import os
+import threading
+from proto import FedCS_pb2, FedCS_pb2_grpc
+from fedasynccs.models import ModelHandler
+from fedasynccs.dataset import FederatedDataset
+from fedasynccs.compression import CompressedSensing
+from concurrent import futures
 
-# Import generated gRPC modules
-import federated_pb2
-import federated_pb2_grpc
-
-# Import local modules
-import models
-import dataset
-from compression import CSCompressor
-
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - Client %(message)s')
-
-class FedACClient:
-    def __init__(self, client_id, server_address, conf):
+class Client(FedCS_pb2_grpc.FederatedLearningClientServicer):
+    def __init__(self, client_id, port, config):
         self.client_id = client_id
-        self.conf = conf
-        self.device = models.get_device()
+        self.port = port
+        self.config = config
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
         
-        # 1. gRPC Connection
-        options = [('grpc.max_send_message_length', 50 * 1024 * 1024), 
-                   ('grpc.max_receive_message_length', 50 * 1024 * 1024)]
-        self.channel = grpc.insecure_channel(server_address, options=options)
-        self.stub = federated_pb2_grpc.FederatedLearningStub(self.channel)
+        # Data & Model
+        self.data = FederatedDataset(config['paths']['data_dir'], mode="mnist")
+        self.model = ModelHandler(self.device, self.data)
         
-        # 2. Data Loading
-        logging.info(f"Loading {conf['dataset']} dataset...")
-        train_ds, _ = dataset.get_dataset(conf['dataset'])
+        # Compressed Sensing
+        if "cs" in config['federated']['method']:
+            params = {k: v for k, v in self.model.get_weights().items()}
+            num_params = len(torch.cat([v.flatten() for v in params.values()]))
+            self.cs = CompressedSensing(num_params, self.device, config['method_args'], save_dir=config['paths']['data_dir'])
+            
+        self.register_with_etcd()
+
+    def register_with_etcd(self):
+        etcd = etcd3.client(host=self.config['etcd']['host'], port=int(self.config['etcd']['port']))
+        key = f"/clients/{self.client_id}"
+        value = f"localhost:{self.port}"
+        etcd.put(key, value)
+        print(f"Registered {self.client_id} at {value}")
+
+    # RPC Implementations
+    def SendModel(self, request, context):
+        buffer = io.BytesIO(request.content)
+        state_dict = torch.load(buffer, map_location=self.device)
+        self.model.set_weights(state_dict)
+        return FedCS_pb2.Status(ack=True)
+
+    def StartTraining(self, request, context):
+        # Baseline FedAvg
+        self.model.train(int(self.client_id))
         
-        partitions = dataset.partition_data_dirichlet(
-            train_ds, 
-            num_clients=conf['num_clients'], 
-            alpha=conf['alpha'], 
-            seed=42
-        )
-        my_indices = partitions[client_id]
-        self.train_loader = dataset.get_dataloader(train_ds, my_indices, conf['batch_size'])
-        self.num_samples = len(my_indices)
+        buffer = io.BytesIO()
+        torch.save(self.model.get_weights(), buffer)
+        return FedCS_pb2.ModelFile(content=buffer.getvalue())
+
+    def Phase1_CSFL(self, request, context):
+        # 1. Store initial weights w_t
+        self.w_prev = {k: v.clone() for k, v in self.model.get_weights().items()}
         
-        # 3. Model Initialization
-        self.model = models.get_model(conf['dataset']).to(self.device)
+        # 2. Train to get w_t+1
+        self.model.train(int(self.client_id))
         
-        # Helper to get total params
-        self.total_params = sum(p.numel() for p in self.model.parameters())
+        # 3. Calc gradient: w_t+1 - w_t
+        w_curr = self.model.get_weights()
+        grad_flat = torch.cat([(w_curr[k] - self.w_prev[k]).flatten() for k in w_curr])
         
-        # 4. Compressed Sensing Module
-        self.compressor = CSCompressor(
-            original_dim=self.total_params, 
-            compression_ratio=conf['compression_ratio'],
-            device=self.device
-        )
+        # 4. Sparsify
+        self.s = self.cs.sparsify(grad_flat, self.config['method_args']['sparsity_thresh'])
+        self.e = grad_flat - self.s # Store error for Phase 2
+
+        # 5. CS Compression (A @ s)
+        y = self.cs.A @ self.s.to(self.device)
         
-        # CS Error Feedback (Residual) - kept as Tensor on device
-        self.cs_residual = torch.zeros(self.total_params, device=self.device)
+        return FedCS_pb2.ModelFlat(content=y.cpu().numpy().tolist())
+
+    def SignSGD(self, request, context):
+        # 1. Store initial weights w_t
+        self.w_prev = {k: v.clone() for k, v in self.model.get_weights().items()}
         
-        # 5. FedAC State Variables (kept as Tensors on device for speed)
-        self.c_i = torch.zeros(self.total_params, device=self.device)
-        self.c_tau = torch.zeros(self.total_params, device=self.device)
+        # 2. Train to get w_t+1
+        self.model.train(int(self.client_id))
+        
+        # 3. Calc gradient: w_t+1 - w_t
+        w_curr = self.model.get_weights()
+        grad_flat = torch.cat([(w_curr[k] - self.w_prev[k]).flatten() for k in w_curr])
+        
+        # 4. Sign
+        return FedCS_pb2.ModelFlatSign(content=[True if i >= 0 else False for i in grad_flat])
 
-    def set_parameters_from_numpy(self, flat_numpy):
-        """Load flat numpy array into model parameters."""
-        tensor_data = torch.from_numpy(flat_numpy).to(self.device)
-        torch.nn.utils.vector_to_parameters(tensor_data, self.model.parameters())
+    def Phase1_1B_CSFL(self, request, context):
+        # 1. Store initial weights w_t
+        self.w_prev = {k: v.clone() for k, v in self.model.get_weights().items()}
+        
+        # 2. Train to get w_t+1
+        self.model.train(int(self.client_id))
+        
+        # 3. Calc gradient: w_t+1 - w_t
+        w_curr = self.model.get_weights()
+        grad_flat = torch.cat([(w_curr[k] - self.w_prev[k]).flatten() for k in w_curr])
+        
+        # 4. Sparsify
+        self.s = self.cs.sparsify(grad_flat, self.config['method_args']['sparsity_thresh'])
+        self.e = grad_flat - self.s # Store error for Phase 2
 
-    def get_parameters_as_tensor(self):
-        """Get flat tensor of current parameters."""
-        return torch.nn.utils.parameters_to_vector(self.model.parameters()).detach()
+        # 5. CS Compression (A @ s)
+        y = self.cs.A @ self.s.to(self.device)
+        
+        # 6. 1-bit quantization (sign)
+        return FedCS_pb2.ModelFlatSign(content=[True if i >= 0 else False for i in y])
 
-    def train_and_update(self):
-        while True:
-            try:
-                # --- STEP 1: Pull Global Model & Correction Term ---
-                logging.info("Requesting global model...")
-                response = self.stub.GetGlobalModel(federated_pb2.Empty())
-                
-                global_round_id = response.round_id
-                
-                # Load Global Weights (x^t)
-                global_weights_np = np.array(response.weights, dtype=np.float32)
-                self.set_parameters_from_numpy(global_weights_np)
-                
-                # Keep a copy of start model (x_tau) for delta calculation
-                start_model_tensor = self.get_parameters_as_tensor()
-                
-                # Load Global Correction (c^t)
-                if len(response.global_control_variate) > 0:
-                    c_tau_np = np.array(response.global_control_variate, dtype=np.float32)
-                    self.c_tau = torch.from_numpy(c_tau_np).to(self.device)
-                
-                logging.info(f"Round {global_round_id}: Training on {self.num_samples} samples.")
+    def Phase2(self, request, context):
+        # 1. Train again from updated weights
+        self.model.train(int(self.client_id))
+        
+        # 2. Calculate new gradient
+        w_curr = self.model.get_weights()
+        # self.w_reconstructed is the w_t updated with global gradient from Phase 1
+        grad_flat = torch.cat([(w_curr[k] - self.w_reconstructed[k]).flatten() for k in w_curr])
+        
+        # 3. Add error from Phase 1
+        total_delta = grad_flat + self.e
+        
+        # 4. Sign of the total delta
+        return FedCS_pb2.ModelFlatSign(content=[True if i >= 0 else False for i in total_delta])
 
-                # --- STEP 2: Local Training with FedAC Correction ---
-                if self.conf['use_1bit']:
-                    # 1-bit reconstruction often requires smaller steps
-                    optimizer = torch.optim.SGD(self.model.parameters(), lr=0.001) 
-                else:
-                    optimizer = torch.optim.SGD(self.model.parameters(), lr=CONFIG['lr'])
-                    
-                optimizer = torch.optim.SGD(self.model.parameters(), lr=self.conf['lr'])
-                self.model.train()
+    def UpdateClientWeightsSign(self, request, context):
+        # Receive global sign vector, update local model
+        # For 1-bit CS, this is the reconstructed gradient step
+        signs = torch.tensor([1 if i else -1 for i in request.content]).float().to(self.device)
+        
+        # Server sends z_global (Phase 1) or r_global (Phase 2)
+        # We need to distinguish based on metadata or infer?
+        # The server sends metadata "type"
+        
+        method = dict(context.invocation_metadata())['type']
+        
+        if method == "Phase1-CSFL":
+            y_global = torch.tensor(request.content).float().to(self.device)
+            s = self.cs.iht(self.cs.A, y_global)
+            lr = self.config['method_args']['lr_1']
+            
+            # Apply update to PREVIOUS weights (w_t)
+            w = self.w_prev
+            ptr = 0
+            for key, v in w.items():
+                numel = v.numel()
+                upd = s[ptr : ptr + numel].reshape(v.shape)
+                w[key] = w[key] + lr * upd
+                ptr += numel
                 
-                # FedAC correction term: (c_tau - c_i)
-                # We add this to the gradients at every step.
-                correction_diff = self.c_tau - self.c_i
-                
-                steps = 0
-                for epoch in range(self.conf['local_epochs']):
-                    for data, target in self.train_loader:
-                        data, target = data.to(self.device), target.to(self.device)
-                        optimizer.zero_grad()
-                        
-                        output = self.model(data)
-                        loss = torch.nn.functional.cross_entropy(output, target)
-                        loss.backward()
-                        
-                        # --- FedAC Correction Injection ---
-                        # w_{k+1} = w_k - lr * (grad + c_tau - c_i)
-                        # We modify grad: p.grad = p.grad + (c_tau - c_i)
-                        start_idx = 0
-                        for p in self.model.parameters():
-                            numel = p.numel()
-                            if p.grad is not None:
-                                layer_correction = correction_diff[start_idx:start_idx+numel].view(p.shape)
-                                p.grad.add_(layer_correction)
-                            start_idx += numel
-                            
-                        optimizer.step()
-                        steps += 1
+            self.model.set_weights(w)
+            self.w_reconstructed = {k: v.clone() for k, v in w.items()} # Save for Phase 2
 
-                # --- STEP 3: Post-Training Calculations (FedAC & CS) ---
-                
-                final_model_tensor = self.get_parameters_as_tensor()
-                
-                # A. Calculate Pseudo-Gradient / Actual Update
-                # update_vector = x_start - x_final (The direction server needs to add if using server learning rate)
-                # In FedBuff: delta = x_{i,K} - x_tau. 
-                # Here we calculate: actual_update = x_final - x_start (This is the accumulated negative gradient)
-                actual_update_vector = final_model_tensor - start_model_tensor
-                
-                # B. Update Local Control Variate (c_i)
-                # Eq (14): c_new = c_i - c_tau + (x_start - x_final) / (K * eta)
-                # Note: (x_start - x_final) / (K*eta) approximates the average gradient.
-                K = steps
-                eta = self.conf['lr']
-                
-                # Careful with signs:
-                # avg_grad = (start - final) / (K * eta)
-                avg_gradient = (start_model_tensor - final_model_tensor) / (K * eta)
-                
-                c_i_new = avg_gradient - correction_diff
-                
-                # Calculate delta for server: delta_c = c_new - c_old
-                delta_c_i = c_i_new - self.c_i
-                
-                # Update local state
-                self.c_i = c_i_new
+        elif method == "SignSGD":
+            signs = torch.tensor([1 if i else -1 for i in request.content]).float().to(self.device)
+            lr = self.config['method_args']['lr_2']
+            
+            # Apply to PREVIOUS weights (w_t)
+            w = self.w_prev
+            ptr = 0
+            for key, v in w.items():
+                numel = v.numel()
+                upd = signs[ptr : ptr + numel].reshape(v.shape)
+                w[key] = w[key] + lr * upd
+                ptr += numel
+            self.model.set_weights(w)
 
-                # C. Compress the Model Update (actual_update_vector)
-                seed = int(time.time() * 1000) % 100000
+        elif method == "Phase1-1B-CSFL":
+            grad_update = self.cs.biht(self.cs.A, signs)
+            lr = self.config['method_args']['lr_1']
+            
+            # Apply update to PREVIOUS weights (w_t)
+            w = self.w_prev
+            ptr = 0
+            for key, v in w.items():
+                numel = v.numel()
+                upd = grad_update[ptr : ptr + numel].reshape(v.shape)
+                w[key] = w[key] + lr * upd
+                ptr += numel
                 
-                packed_payload, new_residual = self.compressor.compress(
-                    update_vector=actual_update_vector, 
-                    residual_vector=self.cs_residual, 
-                    seed=seed, 
-                    use_1bit=self.conf['use_1bit']
-                )
+            self.model.set_weights(w)
+            self.w_reconstructed = {k: v.clone() for k, v in w.items()} # Save for Phase 2
+            
+        elif method == "Phase2":
+            # Direct sign update
+            grad_update = signs
+            lr = self.config['method_args']['lr_2']
+            
+            # Apply to w_reconstructed (the weights after Phase 1)
+            # NOT the currently trained weights from Phase 2 training
+            w = self.w_reconstructed
+            ptr = 0
+            for key, v in w.items():
+                numel = v.numel()
+                upd = grad_update[ptr : ptr + numel].reshape(v.shape)
+                w[key] = w[key] + lr * upd
+                ptr += numel
+            self.model.set_weights(w)
+
+        return FedCS_pb2.Status(ack=True)
+
+    def UpdateClientWeights(self, request, context):
+        # Delegate to UpdateClientWeightsSign logic but handle float content
+        # Actually, the logic is slightly different for float content (Phase1-CSFL)
+        # We can reuse the logic if we extract it, but for now let's just implement it here
+        # Wait, UpdateClientWeightsSign takes ModelFlatSign, UpdateClientWeights takes ModelFlat
+        
+        method = dict(context.invocation_metadata())['type']
+        
+        if method == "Phase1-CSFL":
+            y_global = torch.tensor(request.content).float().to(self.device)
+            s = self.cs.iht(self.cs.A, y_global)
+            lr = self.config['method_args']['lr_1']
+            
+            # Apply update to PREVIOUS weights (w_t)
+            w = self.w_prev
+            ptr = 0
+            for key, v in w.items():
+                numel = v.numel()
+                upd = s[ptr : ptr + numel].reshape(v.shape)
+                w[key] = w[key] + lr * upd
+                ptr += numel
                 
-                self.cs_residual = new_residual
-                
-                # Convert payload to bytes if it isn't already (for analog case)
-                if self.conf['use_1bit']:
-                    payload_bytes = packed_payload # It's already bytes from _pack_bits
-                else:
-                    payload_bytes = packed_payload.cpu().numpy().tobytes()
+            self.model.set_weights(w)
+            self.w_reconstructed = {k: v.clone() for k, v in w.items()} # Save for Phase 2
+            
+        return FedCS_pb2.Status(ack=True)
 
-                # --- STEP 4: Push Update via gRPC ---
-                logging.info("Sending compressed update...")
-                
-                update_msg = federated_pb2.ClientUpdate(
-                    client_id=str(self.client_id),
-                    base_model_round_id=global_round_id,
-                    compressed_payload=payload_bytes,
-                    measurement_seed=seed,
-                    original_vector_len=self.total_params,
-                    compressed_vector_len=self.compressor.M,
-                    # Note: sending uncompressed delta_c_i is a bottleneck but required for FedAC correctness 
-                    # unless we implement sparsification for control variates too.
-                    delta_control_variate=delta_c_i.cpu().numpy().tolist(),
-                    num_samples=self.num_samples,
-                    is_1bit=self.conf['use_1bit']
-                )
-                
-                self.stub.SubmitUpdate(update_msg)
-                logging.info("Update submitted. Sleeping...")
-                time.sleep(1) # Throttle
+    def Terminate(self, request, context):
+        print(f"Client {self.client_id} terminating...")
+        threading.Thread(target=self.server.stop, args=(0,)).start()
+        return FedCS_pb2.Empty()
 
-            except grpc.RpcError as e:
-                logging.error(f"gRPC Error: {e}")
-                time.sleep(5)
-            except Exception as e:
-                logging.error(f"Error: {e}")
-                time.sleep(5)
-
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--id', type=int, required=True)
-    parser.add_argument('--server', type=str, default='localhost:50051')
-    args = parser.parse_args()
-
-    config = {
-        'dataset': 'mnist',
-        'num_clients': 10,
-        'alpha': 0.5,
-        'batch_size': 32,
-        'lr': 0.01,
-        'local_epochs': 1,
-        'compression_ratio': 0.1,
-        'use_1bit': True
-    }
-
-    client = FedACClient(args.id, args.server, config)
-    client.train_and_update()
+def serve(client_id, config):
+    port = int(config['server']['port']) + int(client_id) + 1
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=5))
+    client = Client(client_id, port, config)
+    client.server = server # Attach server instance to client
+    
+    FedCS_pb2_grpc.add_FederatedLearningClientServicer_to_server(client, server)
+    server.add_insecure_port(f"[::]:{port}")
+    server.start()
+    print(f"Client {client_id} listening on {port}")
+    server.wait_for_termination()

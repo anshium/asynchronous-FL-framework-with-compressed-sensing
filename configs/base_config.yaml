@@ -1,19 +1,26 @@
-# For system configuration, num clients, num rounds, epochs, learning rate, model, non-iid params, 
+server:
+  ip: "127.0.0.1"
+  port: "60051"
 
-# ex.
+etcd:
+  host: "127.0.0.1"
+  port: "2379"
 
-dataset: "mnist"
-model: "cnn"
-non_iid_alpha: 0.5
+federated:
+  num_clients: 3
+  num_epochs: 10
+  method: "1bit-cs-fl" 
+  # method : "fedavg"
+  # Options: "baseline", "fedavg", "sign-sgd", "cs-fl", "1bit-cs-fl"
 
-# Federated Learning
-num_clients: 50
-num_rounds: 100
-local_epochs: 5
-learning_rate: 0.01
+paths:
+  # Where trained models are saved
+  model_storage: "models" 
+  # Where the dataset is stored
+  data_dir: "data"
 
-# FedAsynCS Specific
-server_buffer_size: 10
-compression_ratio: 0.1
-
-# (may need to add stuff based on changing requirements)
+method_args:
+  sparsity_thresh: 0.005
+  compression_ratio: 0.05
+  lr_1: 0.2
+  lr_2: 0.002

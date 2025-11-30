@@ -1,17 +1,27 @@
-# This would be the entrypoint to the launch the simulation.
+import argparse
+import yaml
+import sys
+import os
 
-# Pass Arguments
+# Add local directory to path
+sys.path.append(os.getcwd())
 
-# Load Config File (that contains all hyperparameters)
+def load_config(path="configs/base_config.yaml"):
+    with open(path, "r") as f:
+        return yaml.safe_load(f)
 
-# Initialise Logging, random seeds etc.
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--role", choices=["server", "client"], required=True)
+    parser.add_argument("--id", help="Client ID (required for client)", default="1")
+    parser.add_argument("--config", default="configs/base_config.yaml")
+    args = parser.parse_args()
 
-# Load dataset and distribute to clients using `dataset.py`
-
-# Instantiate the Server and Client classes (objects)
-
-# SPAWN CLIENTS: Maybe use multiprocessing library to create a pool of client that run in parallel
-
-# Run main training loop for x number of steps
-
-# Save final results
+    config = load_config(args.config)
+    
+    if args.role == "server":
+        from fedasynccs.server import serve
+        serve(config)
+    else:
+        from fedasynccs.client import serve
+        serve(args.id, config)
