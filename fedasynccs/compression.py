@@ -31,6 +31,11 @@ class CompressedSensing:
             self.A = torch.randn(m, n).to(self.device)
             torch.save(self.A, save_file)
             print(f"Generated A ({m}x{n}) at {save_file}")
+            
+        # Cache spectral norm for IHT
+        print("Calculating spectral norm of A (this may take a moment)...")
+        self.mu = 1 / (torch.norm(self.A, 2) ** 2)
+        print("Spectral norm calculated.")
     
     @staticmethod
     def sparsify(grad, p):
@@ -44,10 +49,10 @@ class CompressedSensing:
     
     def iht(self, A, y, max_iter=50):
         # Iterative Hard Thresholding
-        mu = 1 / (torch.norm(self.A, 2) ** 2)
+        # Use cached mu
         x = torch.zeros(A.shape[1], device=self.device)
         for _ in range(max_iter):
-            x = x + mu * A.T @ (y - A @ x)
+            x = x + self.mu * A.T @ (y - A @ x)
             x = self.sparsify(x, self.sparsity_thresh)
         return x
 

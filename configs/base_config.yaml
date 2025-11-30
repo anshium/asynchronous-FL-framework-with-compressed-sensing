@@ -10,6 +10,7 @@ federated:
   num_clients: 3
   num_epochs: 5
   method: "1bit-cs-fl" 
+  # method : "fedavg"
   # Options: "baseline", "fedavg", "sign-sgd", "cs-fl", "1bit-cs-fl"
 
 paths:
@@ -20,6 +21,6 @@ paths:
 
 method_args:
   sparsity_thresh: 0.005
-  compression_ratio: 0.1
+  compression_ratio: 0.05
   lr_1: 0.1
   lr_2: 0.002

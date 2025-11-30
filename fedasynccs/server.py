@@ -27,7 +27,7 @@ def aggregate_weights(weight_dict, method):
         return avg_weights
         
     elif method == "average_flattened":
-        return torch.mean(torch.tensor(weight_list), dim=0)
+        return torch.mean(torch.stack(weight_list), dim=0)
         
     elif method == "average_flattened_sign":
         avg_weights = torch.sum(torch.tensor(weight_list, dtype=torch.float), dim=0)
@@ -42,6 +42,13 @@ class Server(FedCS_pb2_grpc.FederatedLearningServerServicer):
         self.etcd = etcd3.client(host=config['etcd']['host'], port=int(config['etcd']['port']))
         self.watch_active = True
         
+        # Auto-cleanup stale clients
+        print("Cleaning up stale clients...")
+        try:
+            self.etcd.delete_prefix("/clients/")
+        except Exception as e:
+            print(f"Warning: Failed to clean up clients: {e}")
+
         # Initialize components
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.data = FederatedDataset(config['paths']['data_dir'], mode="mnist") # or random/fashion
@@ -118,26 +125,62 @@ class Server(FedCS_pb2_grpc.FederatedLearningServerServicer):
                 bool_weights = [True if i > 0 else False for i in weights]
                 stub.UpdateClientWeightsSign(FedCS_pb2.ModelFlatSign(content=bool_weights), metadata=meta)
 
+    def terminate_all_clients(self):
+        print("Terminating all clients...")
+        for client_addr in self.clients.values():
+            try:
+                with grpc.insecure_channel(client_addr) as channel:
+                    stub = FedCS_pb2_grpc.FederatedLearningClientStub(channel)
+                    stub.Terminate(FedCS_pb2.Empty())
+            except Exception as e:
+                print(f"Failed to terminate {client_addr}: {e}")
+
     def run(self):
         method = self.config['federated']['method']
         print(f"Starting Server with method: {method}")
         
+        # Setup Logging
+        log_dir = "logs"
+        os.makedirs(log_dir, exist_ok=True)
+        log_file = os.path.join(log_dir, f"{method}_{int(time.time())}.txt")
+        print(f"Logging to {log_file}")
+        
+        def log(msg):
+            print(msg)
+            with open(log_file, "a") as f:
+                f.write(msg + "\n")
+
         # Initial Save
         model_path = os.path.join(self.config['paths']['model_storage'], "global_model.pth")
         self.model.save(model_path)
 
-        for epoch in range(self.config['federated']['num_epochs']):
-            print(f"\n--- Epoch {epoch+1} ---")
-            clients = self.get_clients(self.config['federated']['num_clients'])
-            
-            # 1. Distribute Model
+        # Wait for clients
+        log("Waiting for clients...")
+        clients = self.get_clients(self.config['federated']['num_clients'])
+        log(f"Clients connected: {len(clients)}")
+
+        # Distribute Model ONCE for CS/Sign methods
+        if method in ["cs-fl", "1bit-cs-fl", "sign-sgd"]:
             with open(model_path, "rb") as f:
                 model_bytes = f.read()
-            
             threads = [threading.Thread(target=self.rpc_send_model, args=(c, model_bytes)) for c in clients]
             [t.start() for t in threads]
             [t.join() for t in threads]
-            print("Model distributed.")
+            log("Model distributed (Initial).")
+
+        for epoch in range(self.config['federated']['num_epochs']):
+            log(f"\n--- Epoch {epoch+1} ---")
+            # Re-sample clients if needed, but for now we use the same set or re-fetch
+            clients = self.get_clients(self.config['federated']['num_clients'])
+            
+            # 1. Distribute Model (FedAvg only)
+            if method == "fedavg":
+                with open(model_path, "rb") as f:
+                    model_bytes = f.read()
+                threads = [threading.Thread(target=self.rpc_send_model, args=(c, model_bytes)) for c in clients]
+                [t.start() for t in threads]
+                [t.join() for t in threads]
+                log("Model distributed.")
 
             # 2. Training Phase
             results = {}
@@ -150,6 +193,56 @@ class Server(FedCS_pb2_grpc.FederatedLearningServerServicer):
                 avg = aggregate_weights(results, "average")
                 self.model.set_weights(avg)
 
+            elif method == "sign-sgd":
+                threads = [threading.Thread(target=self.rpc_start_training, args=(c, "SignSGD", results)) for c in clients]
+                [t.start() for t in threads]
+                [t.join() for t in threads]
+                
+                avg_weights = aggregate_weights(results, "average_flattened_sign")
+                
+                # Send back global sign
+                threads = [threading.Thread(target=self.rpc_update_weights, args=(c, avg_weights, "SignSGD")) for c in self.clients.values()]
+                [t.start() for t in threads]
+                [t.join() for t in threads]
+                
+                # Server Update
+                r_tensor = torch.tensor([1 if i else -1 for i in avg_weights]).float().to(self.device)
+                self._apply_flat_update(r_tensor, self.config['method_args']['lr_2'])
+
+            elif method == "cs-fl":
+                # Phase 1
+                threads = [threading.Thread(target=self.rpc_start_training, args=(c, "Phase1-CSFL", results)) for c in clients]
+                [t.start() for t in threads]
+                [t.join() for t in threads]
+                
+                y_global = aggregate_weights(results, "average_flattened")
+                
+                # Send back y_global
+                threads = [threading.Thread(target=self.rpc_update_weights, args=(c, y_global, "Phase1-CSFL")) for c in self.clients.values()]
+                [t.start() for t in threads]
+                [t.join() for t in threads]
+                
+                # Server Update (Phase 1)
+                s = self.cs.iht(self.cs.A, y_global.to(self.device))
+                self._apply_flat_update(s, self.config['method_args']['lr_1'])
+                
+                # Phase 2
+                results_p2 = {}
+                threads = [threading.Thread(target=self.rpc_start_training, args=(c, "Phase2", results_p2)) for c in clients]
+                [t.start() for t in threads]
+                [t.join() for t in threads]
+                
+                r_global = aggregate_weights(results_p2, "average_flattened_sign")
+                
+                 # Send back r_global
+                threads = [threading.Thread(target=self.rpc_update_weights, args=(c, r_global, "Phase2")) for c in self.clients.values()]
+                [t.start() for t in threads]
+                [t.join() for t in threads]
+                
+                # Server Update (Phase 2)
+                r_tensor = torch.tensor([1 if i else -1 for i in r_global]).float().to(self.device)
+                self._apply_flat_update(r_tensor, self.config['method_args']['lr_2'])
+
             elif method == "1bit-cs-fl":
                 # Phase 1
                 threads = [threading.Thread(target=self.rpc_start_training, args=(c, "Phase1-1B-CSFL", results)) for c in clients]
@@ -159,7 +252,7 @@ class Server(FedCS_pb2_grpc.FederatedLearningServerServicer):
                 z_global = aggregate_weights(results, "average_flattened_sign")
                 
                 if z_global is None:
-                    print("⚠️ No valid updates received in Phase 2. Skipping.")
+                    log("⚠️ No valid updates received in Phase 2. Skipping.")
                     continue
                 
                 # Send back z_global
@@ -181,7 +274,7 @@ class Server(FedCS_pb2_grpc.FederatedLearningServerServicer):
                 r_global = aggregate_weights(results_p2, "average_flattened_sign")
                 
                 if r_global is None:
-                    print("⚠️ No valid updates received in Phase 2. Skipping.")
+                    log("⚠️ No valid updates received in Phase 2. Skipping.")
                     continue
                  # Send back r_global
                 threads = [threading.Thread(target=self.rpc_update_weights, args=(c, r_global, "Phase2")) for c in self.clients.values()]
@@ -191,14 +284,16 @@ class Server(FedCS_pb2_grpc.FederatedLearningServerServicer):
                 # Server Update (Phase 2)
                 r_tensor = torch.tensor([1 if i else -1 for i in r_global]).float().to(self.device)
 
-                print("Decompressing Phase 2 updates... (Skipped, using direct sign)")
                 # r_reconstructed = self.cs.biht(self.cs.A, r_tensor)
                 self._apply_flat_update(r_tensor, self.config['method_args']['lr_2'])
 
             
             # Save and Eval
             self.model.save(model_path)
-            self.model.evaluate()
+            loss, acc = self.model.evaluate()
+            log(f"Epoch {epoch+1} Eval - Loss: {loss:.4f}, Acc: {acc:.2f}%")
+
+        self.terminate_all_clients()
 
     def _apply_flat_update(self, flat_update, lr):
         w = self.model.get_weights()
@@ -217,5 +312,8 @@ def serve(config):
     grpc_server.add_insecure_port(f"{config['server']['ip']}:{config['server']['port']}")
     grpc_server.start()
     
-    server.run()
-    grpc_server.wait_for_termination()
+    try:
+        server.run()
+    finally:
+        print("Stopping server...")
+        grpc_server.stop(0)
