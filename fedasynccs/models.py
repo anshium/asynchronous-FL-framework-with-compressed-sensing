@@ -8,10 +8,11 @@ import os
 class Net(nn.Module):
     def __init__(self):
         super(Net, self).__init__()
-        self.conv1 = nn.Conv2d(1, 16, kernel_size=5, stride=1)
-        self.conv2 = nn.Conv2d(16, 32, kernel_size=5, stride=1)
-        self.fc1 = nn.Linear(512, 128)
-        self.fc2 = nn.Linear(128, 10)
+        # Optimized for CS-FL: ~22k params
+        self.conv1 = nn.Conv2d(1, 8, kernel_size=5, stride=1)
+        self.conv2 = nn.Conv2d(8, 16, kernel_size=5, stride=1)
+        self.fc1 = nn.Linear(256, 64) # 16 * 4 * 4 = 256
+        self.fc2 = nn.Linear(64, 10)
 
     def forward(self, x):
         # Ensure input is [Batch, 1, 28, 28] (MNIST/Fashion)
@@ -20,7 +21,7 @@ class Net(nn.Module):
         
         x = F.relu(F.max_pool2d(self.conv1(x), 2))
         x = F.relu(F.max_pool2d(self.conv2(x), 2))
-        x = x.view(-1, 512)
+        x = x.view(-1, 256) # Flatten
         x = F.relu(self.fc1(x))
         x = self.fc2(x)
         return F.log_softmax(x, dim=1)

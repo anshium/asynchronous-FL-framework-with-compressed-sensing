@@ -8,7 +8,7 @@ etcd:
 
 federated:
   num_clients: 3
-  num_epochs: 5
+  num_epochs: 10
   method: "1bit-cs-fl" 
   # method : "fedavg"
   # Options: "baseline", "fedavg", "sign-sgd", "cs-fl", "1bit-cs-fl"

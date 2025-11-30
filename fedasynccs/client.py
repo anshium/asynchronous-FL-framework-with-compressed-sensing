@@ -4,6 +4,7 @@ import io
 import etcd3
 import sys
 import os
+import threading
 from proto import FedCS_pb2, FedCS_pb2_grpc
 from fedasynccs.models import ModelHandler
 from fedasynccs.dataset import FederatedDataset
@@ -184,8 +185,9 @@ class Client(FedCS_pb2_grpc.FederatedLearningClientServicer):
             grad_update = signs
             lr = self.config['method_args']['lr_2']
             
-            # Apply to current weights (which are w_reconstructed from Phase 1)
-            w = self.model.get_weights()
+            # Apply to w_reconstructed (the weights after Phase 1)
+            # NOT the currently trained weights from Phase 2 training
+            w = self.w_reconstructed
             ptr = 0
             for key, v in w.items():
                 numel = v.numel()

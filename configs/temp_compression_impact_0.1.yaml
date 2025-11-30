@@ -5,7 +5,7 @@ experiment_name: compression_impact_0.1
 federated:
   method: 1bit-cs-fl
   num_clients: 3
-  num_epochs: 5
+  num_epochs: 10
 method_args:
   compression_ratio: 0.1
   lr_1: 0.1

@@ -5,5 +5,7 @@ models/
 logs/
 results/
 data/
-
+default.etcd/
 .agent
+__pycache__
+configs/temp*
