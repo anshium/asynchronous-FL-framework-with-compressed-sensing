@@ -291,9 +291,53 @@ class Server(FedCS_pb2_grpc.FederatedLearningServerServicer):
             # Save and Eval
             self.model.save(model_path)
             loss, acc = self.model.evaluate()
-            log(f"Epoch {epoch+1} Eval - Loss: {loss:.4f}, Acc: {acc:.2f}%")
+            # Save and Eval
+            self.model.save(model_path)
+            loss, acc = self.model.evaluate()
+            
+            # Log metrics
+            self.log_metrics(epoch, loss, acc)
 
-        self.terminate_all_clients()
+        print("Training complete. Terminating clients...")
+        threads = [threading.Thread(target=self.rpc_terminate, args=(c,)) for c in self.clients.values()]
+        [t.start() for t in threads]
+        [t.join() for t in threads]
+        print("Clients terminated.")
+
+    def rpc_terminate(self, client_addr):
+        try:
+            with grpc.insecure_channel(client_addr) as channel:
+                stub = FedCS_pb2_grpc.FederatedLearningClientStub(channel)
+                stub.Terminate(FedCS_pb2.Empty(), timeout=1.0)
+        except:
+            pass
+
+    def log_metrics(self, epoch, loss, acc):
+        import json
+        
+        log_file = os.path.join(self.config['paths']['results_dir'], f"metrics_{self.config['experiment_name']}.json")
+        os.makedirs(os.path.dirname(log_file), exist_ok=True)
+        
+        entry = {
+            "epoch": epoch + 1,
+            "loss": loss,
+            "accuracy": acc,
+            "timestamp": time.time()
+        }
+        
+        if os.path.exists(log_file):
+            with open(log_file, "r") as f:
+                try:
+                    data = json.load(f)
+                except json.JSONDecodeError:
+                    data = []
+        else:
+            data = []
+            
+        data.append(entry)
+        
+        with open(log_file, "w") as f:
+            json.dump(data, f, indent=4)
 
     def _apply_flat_update(self, flat_update, lr):
         w = self.model.get_weights()
