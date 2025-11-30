@@ -3,7 +3,6 @@ import subprocess
 
 def main():
     ratios = [0.01, 0.03, 0.05, 0.1]
-    
     for r in ratios:
         updates = {
             "federated": {

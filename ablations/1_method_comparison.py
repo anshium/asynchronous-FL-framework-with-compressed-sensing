@@ -1,7 +1,7 @@
 from utils import run_experiment
 
 def main():
-    methods = ["sign-sgd", "1bit-cs-fl", "fedavg"]
+    methods = ["sign-sgd", "1bit-cs-fl", "cs-fl", "fedavg"]
     
     for method in methods:
         updates = {

@@ -22,5 +22,5 @@ paths:
 method_args:
   sparsity_thresh: 0.005
   compression_ratio: 0.05
-  lr_1: 0.1
+  lr_1: 0.2
   lr_2: 0.002
