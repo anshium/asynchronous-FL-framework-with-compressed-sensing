@@ -8,6 +8,7 @@ import io
 import etcd3
 from copy import deepcopy
 import os
+import json  # Added for metrics logging
 
 from proto import FedCS_pb2, FedCS_pb2_grpc
 from fedasynccs.models import ModelHandler
@@ -42,7 +43,7 @@ class Server(FedCS_pb2_grpc.FederatedLearningServerServicer):
         self.etcd = etcd3.client(host=config['etcd']['host'], port=int(config['etcd']['port']))
         self.watch_active = True
         
-        # Auto-cleanup stale clients
+        # Auto-cleanup stale clients (From File 1)
         print("Cleaning up stale clients...")
         try:
             self.etcd.delete_prefix("/clients/")
@@ -135,11 +136,44 @@ class Server(FedCS_pb2_grpc.FederatedLearningServerServicer):
             except Exception as e:
                 print(f"Failed to terminate {client_addr}: {e}")
 
+    # --- Metrics Logger (Integrated from File 2) ---
+    def log_metrics(self, epoch, loss, acc):
+        # Determine experiment name safely
+        exp_name = self.config.get('experiment_name', self.config['federated']['method'])
+        
+        # Ensure results directory exists; use data_dir if results_dir not specified
+        results_dir = self.config['paths'].get('results_dir', self.config['paths']['data_dir'])
+        os.makedirs(results_dir, exist_ok=True)
+        
+        log_file = os.path.join(results_dir, f"metrics_{exp_name}.json")
+        
+        entry = {
+            "epoch": epoch + 1,
+            "loss": loss,
+            "accuracy": acc,
+            "timestamp": time.time()
+        }
+        
+        # Read existing or start new list
+        if os.path.exists(log_file):
+            with open(log_file, "r") as f:
+                try:
+                    data = json.load(f)
+                except json.JSONDecodeError:
+                    data = []
+        else:
+            data = []
+            
+        data.append(entry)
+        
+        with open(log_file, "w") as f:
+            json.dump(data, f, indent=4)
+
     def run(self):
         method = self.config['federated']['method']
         print(f"Starting Server with method: {method}")
         
-        # Setup Logging
+        # Setup Text Logging (From File 1)
         log_dir = "logs"
         os.makedirs(log_dir, exist_ok=True)
         log_file = os.path.join(log_dir, f"{method}_{int(time.time())}.txt")
@@ -159,7 +193,7 @@ class Server(FedCS_pb2_grpc.FederatedLearningServerServicer):
         clients = self.get_clients(self.config['federated']['num_clients'])
         log(f"Clients connected: {len(clients)}")
 
-        # Distribute Model ONCE for CS/Sign methods
+        # Distribute Model ONCE for CS/Sign methods (Optimization from File 1)
         if method in ["cs-fl", "1bit-cs-fl", "sign-sgd"]:
             with open(model_path, "rb") as f:
                 model_bytes = f.read()
@@ -170,7 +204,7 @@ class Server(FedCS_pb2_grpc.FederatedLearningServerServicer):
 
         for epoch in range(self.config['federated']['num_epochs']):
             log(f"\n--- Epoch {epoch+1} ---")
-            # Re-sample clients if needed, but for now we use the same set or re-fetch
+            # Re-sample clients if needed
             clients = self.get_clients(self.config['federated']['num_clients'])
             
             # 1. Distribute Model (FedAvg only)
@@ -252,7 +286,7 @@ class Server(FedCS_pb2_grpc.FederatedLearningServerServicer):
                 z_global = aggregate_weights(results, "average_flattened_sign")
                 
                 if z_global is None:
-                    log("⚠️ No valid updates received in Phase 2. Skipping.")
+                    log("No valid updates received in Phase 2. Skipping.")
                     continue
                 
                 # Send back z_global
@@ -274,7 +308,7 @@ class Server(FedCS_pb2_grpc.FederatedLearningServerServicer):
                 r_global = aggregate_weights(results_p2, "average_flattened_sign")
                 
                 if r_global is None:
-                    log("⚠️ No valid updates received in Phase 2. Skipping.")
+                    log("No valid updates received in Phase 2. Skipping.")
                     continue
                  # Send back r_global
                 threads = [threading.Thread(target=self.rpc_update_weights, args=(c, r_global, "Phase2")) for c in self.clients.values()]
@@ -291,53 +325,12 @@ class Server(FedCS_pb2_grpc.FederatedLearningServerServicer):
             # Save and Eval
             self.model.save(model_path)
             loss, acc = self.model.evaluate()
-            # Save and Eval
-            self.model.save(model_path)
-            loss, acc = self.model.evaluate()
+            log(f"Epoch {epoch+1} Eval - Loss: {loss:.4f}, Acc: {acc:.2f}%")
             
-            # Log metrics
+            # --- Call Metrics Logger ---
             self.log_metrics(epoch, loss, acc)
 
-        print("Training complete. Terminating clients...")
-        threads = [threading.Thread(target=self.rpc_terminate, args=(c,)) for c in self.clients.values()]
-        [t.start() for t in threads]
-        [t.join() for t in threads]
-        print("Clients terminated.")
-
-    def rpc_terminate(self, client_addr):
-        try:
-            with grpc.insecure_channel(client_addr) as channel:
-                stub = FedCS_pb2_grpc.FederatedLearningClientStub(channel)
-                stub.Terminate(FedCS_pb2.Empty(), timeout=1.0)
-        except:
-            pass
-
-    def log_metrics(self, epoch, loss, acc):
-        import json
-        
-        log_file = os.path.join(self.config['paths']['results_dir'], f"metrics_{self.config['experiment_name']}.json")
-        os.makedirs(os.path.dirname(log_file), exist_ok=True)
-        
-        entry = {
-            "epoch": epoch + 1,
-            "loss": loss,
-            "accuracy": acc,
-            "timestamp": time.time()
-        }
-        
-        if os.path.exists(log_file):
-            with open(log_file, "r") as f:
-                try:
-                    data = json.load(f)
-                except json.JSONDecodeError:
-                    data = []
-        else:
-            data = []
-            
-        data.append(entry)
-        
-        with open(log_file, "w") as f:
-            json.dump(data, f, indent=4)
+        self.terminate_all_clients()
 
     def _apply_flat_update(self, flat_update, lr):
         w = self.model.get_weights()

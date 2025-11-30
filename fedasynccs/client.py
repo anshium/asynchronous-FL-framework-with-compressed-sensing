@@ -134,38 +134,7 @@ class Client(FedCS_pb2_grpc.FederatedLearningClientServicer):
         
         method = dict(context.invocation_metadata())['type']
         
-        if method == "Phase1-CSFL":
-            y_global = torch.tensor(request.content).float().to(self.device)
-            s = self.cs.iht(self.cs.A, y_global)
-            lr = self.config['method_args']['lr_1']
-            
-            # Apply update to PREVIOUS weights (w_t)
-            w = self.w_prev
-            ptr = 0
-            for key, v in w.items():
-                numel = v.numel()
-                upd = s[ptr : ptr + numel].reshape(v.shape)
-                w[key] = w[key] + lr * upd
-                ptr += numel
-                
-            self.model.set_weights(w)
-            self.w_reconstructed = {k: v.clone() for k, v in w.items()} # Save for Phase 2
-
-        elif method == "SignSGD":
-            signs = torch.tensor([1 if i else -1 for i in request.content]).float().to(self.device)
-            lr = self.config['method_args']['lr_2']
-            
-            # Apply to PREVIOUS weights (w_t)
-            w = self.w_prev
-            ptr = 0
-            for key, v in w.items():
-                numel = v.numel()
-                upd = signs[ptr : ptr + numel].reshape(v.shape)
-                w[key] = w[key] + lr * upd
-                ptr += numel
-            self.model.set_weights(w)
-
-        elif method == "Phase1-1B-CSFL":
+        if method == "Phase1-1B-CSFL":
             grad_update = self.cs.biht(self.cs.A, signs)
             lr = self.config['method_args']['lr_1']
             
@@ -198,33 +167,6 @@ class Client(FedCS_pb2_grpc.FederatedLearningClientServicer):
 
         return FedCS_pb2.Status(ack=True)
 
-    def UpdateClientWeights(self, request, context):
-        # Delegate to UpdateClientWeightsSign logic but handle float content
-        # Actually, the logic is slightly different for float content (Phase1-CSFL)
-        # We can reuse the logic if we extract it, but for now let's just implement it here
-        # Wait, UpdateClientWeightsSign takes ModelFlatSign, UpdateClientWeights takes ModelFlat
-        
-        method = dict(context.invocation_metadata())['type']
-        
-        if method == "Phase1-CSFL":
-            y_global = torch.tensor(request.content).float().to(self.device)
-            s = self.cs.iht(self.cs.A, y_global)
-            lr = self.config['method_args']['lr_1']
-            
-            # Apply update to PREVIOUS weights (w_t)
-            w = self.w_prev
-            ptr = 0
-            for key, v in w.items():
-                numel = v.numel()
-                upd = s[ptr : ptr + numel].reshape(v.shape)
-                w[key] = w[key] + lr * upd
-                ptr += numel
-                
-            self.model.set_weights(w)
-            self.w_reconstructed = {k: v.clone() for k, v in w.items()} # Save for Phase 2
-            
-        return FedCS_pb2.Status(ack=True)
-
     def Terminate(self, request, context):
         threading.Thread(target=self._delayed_exit, daemon=True).start()
         return FedCS_pb2.Empty()
@@ -236,10 +178,8 @@ class Client(FedCS_pb2_grpc.FederatedLearningClientServicer):
 
 def serve(client_id, config):
     port = int(config['server']['port']) + int(client_id) + 1
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=5))
     client = Client(client_id, port, config)
-    client.server = server # Attach server instance to client
-    
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=5))
     FedCS_pb2_grpc.add_FederatedLearningClientServicer_to_server(client, server)
     server.add_insecure_port(f"[::]:{port}")
     server.start()
