@@ -15,29 +15,27 @@ class CompressedSensing:
         self.generate_measurement_matrix(save_dir)
         
     def generate_measurement_matrix(self, save_dir):
+        save_file = os.path.join(save_dir, "A.pt")
         m = int(self.compression_ratio * self.num_params)
         n = self.num_params
-        save_file = os.path.join(save_dir, f"A_{m}_{n}.pt")
         
         if os.path.exists(save_file):
-            try:
-                self.A = torch.load(save_file, map_location=self.device)
-                print(f"Loaded measurement matrix A from {save_file}")
-                return
-            except Exception as e:
-                print(f"Failed to load {save_file}: {e}. Regenerating...")
-        
-        # Generate deterministically
-        print(f"Generating A ({m}x{n})...")
-        g = torch.Generator(device=self.device)
-        g.manual_seed(42) # Fixed seed for consistency across clients
-        self.A = torch.randn(m, n, generator=g, device=self.device)
-        
-        # Atomic write
-        temp_file = f"{save_file}.tmp.{os.getpid()}"
-        torch.save(self.A, temp_file)
-        os.rename(temp_file, save_file)
-        print(f"Saved A to {save_file}")
+            self.A = torch.load(save_file, map_location=self.device)
+            if self.A.shape != (m, n):
+                print(f"Shape mismatch. Regenerating A: {m}x{n}")
+                self.A = torch.randn(m, n).to(self.device)
+                torch.save(self.A, save_file)
+            else:
+                print("Loaded measurement matrix A.")
+        else:
+            self.A = torch.randn(m, n).to(self.device)
+            torch.save(self.A, save_file)
+            print(f"Generated A ({m}x{n}) at {save_file}")
+            
+        # Cache spectral norm for IHT
+        print("Calculating spectral norm of A (this may take a moment)...")
+        self.mu = 1 / (torch.norm(self.A, 2) ** 2)
+        print("Spectral norm calculated.")
     
     @staticmethod
     def sparsify(grad, p):
