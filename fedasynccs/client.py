@@ -1,7 +1,9 @@
 import grpc
 import torch
 import io
+import threading
 import etcd3
+import time
 import sys
 import os
 from proto import FedCS_pb2, FedCS_pb2_grpc
@@ -132,8 +134,13 @@ class Client(FedCS_pb2_grpc.FederatedLearningClientServicer):
         return FedCS_pb2.Status(ack=True)
 
     def Terminate(self, request, context):
-        sys.exit(0)
+        threading.Thread(target=self._delayed_exit, daemon=True).start()
         return FedCS_pb2.Empty()
+
+    def _delayed_exit(self):
+        time.sleep(0.5)
+        print(f"Client {self.client_id} terminating...")
+        os._exit(0)
 
 def serve(client_id, config):
     port = int(config['server']['port']) + int(client_id) + 1
